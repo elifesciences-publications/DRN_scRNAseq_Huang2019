@@ -1,0 +1,379 @@
+---
+title: "DRN Cell Types Project: Comparison with Linnarsson Dataset - Data Conversion"
+output: 
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+author: "Kee Wui Huang, Sabatini Lab (Harvard Medical School)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+# Notebook Overiew
+This notebook is a part of a series that documents the review analysis for the DRN Cell Types project.
+
+This notebook contains the code used to convert the RNA-seq data from Zeisel et al. (2018) from the loom format into a Seurat object to make it suitable for comparison with our DRN inDrop dataset.
+
+
+# Analysis Workflow
+
+## 1. Load libraries and data object
+```{r}
+library(devtools)
+library(useful)
+library(dplyr)
+library(Matrix)
+library(R6)
+library(hdf5r)
+library(loomR)
+```
+
+Load the loom data file from the Zeisel et al. (2018) dataset:
+```{r}
+lfile <- connect(filename = "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/l6_r3_cholinergic_monoaminergic_and_peptidergic_neurons.loom")
+lfile
+```
+loom object has 3,977 cells x 27,998 genes.
+
+## 2. Find and fetch relevant fields in the loom object
+
+### 2.1 Count matrix
+```{r}
+lfile[["matrix"]]
+```
+
+Check that `lfile$matrix` is a data matrix:
+```{r}
+corner(lfile$matrix[,])
+```
+
+Export the expression matrix and format it to Genes x Cells:
+```{r}
+zeisel.expr <- lfile$matrix[,]
+zeisel.expr <- t(zeisel.expr)
+dim(zeisel.expr)
+corner(zeisel.expr)
+```
+
+### 2.2 Column data (cells)
+Check how many column atrributes there are:
+```{r}
+length(lfile$col.attrs)
+```
+
+```{r}
+lfile$col.attrs
+```
+
+#### 2.2.1 Sex
+```{r}
+table(lfile$col.attrs$Sex[])
+```
+Not sure why there are so many categories here. Will not include this metadata field for now.
+
+
+#### 2.2.2 Cell IDs
+```{r}
+length(lfile$col.attrs$CellID[])
+```
+
+```{r}
+head(lfile$col.attrs$CellID[])
+```
+
+Fetch the cell IDs:
+```{r}
+zeisel.cellIDs <- lfile$col.attrs$CellID[]
+length(zeisel.cellIDs)
+head(zeisel.cellIDs)
+table(table(zeisel.cellIDs))  # make sure that all values are unique (all 1's)
+```
+
+
+#### 2.2.3 Cluster names
+```{r}
+head(lfile$col.attrs$ClusterName[])
+```
+
+Fetch the cluster names:
+```{r}
+zeisel.clusterNames <- lfile$col.attrs$ClusterName[]
+length(zeisel.clusterNames)
+head(zeisel.clusterNames)
+table(zeisel.clusterNames)
+```
+Only 105 neurons in the cluster HBSER1, which is the cluster that they have predicted as being from the DRN/CLi/B9/MRN and likely contains R1-derived 5-HT neurons based on enrichment of *En1*.
+
+Check what `$Cluster` is:
+```{r}
+table(lfile$col.attrs$Clusters[])
+```
+Can't really tell what this field is. Will leave this out for now.
+
+
+#### 2.2.4 Tissue
+```{r}
+table(lfile$col.attrs$Tissue[])
+```
+
+```{r}
+zeisel.tissue <- lfile$col.attrs$Tissue[]
+```
+
+
+```{r}
+table(lfile$col.attrs$Region[])
+```
+
+```{r}
+zeisel.region <- lfile$col.attrs$Region[]
+```
+
+#### 2.2.5 Taxonomy
+```{r}
+table(lfile$col.attrs$Taxonomy_group[])
+```
+
+```{r}
+table(lfile$col.attrs$TaxonomyRank1[])
+```
+
+```{r}
+table(lfile$col.attrs$TaxonomyRank2[])
+```
+
+```{r}
+table(lfile$col.attrs$TaxonomyRank3[])
+```
+
+```{r}
+table(lfile$col.attrs$TaxonomyRank4[])
+```
+`$TaxonomyRank4` and `$TaxonomyGroup` are the same here. `$TaxonomySymbol` is the same thing but as a 4 character string.
+
+
+#### 2.2.6 Strain/Species
+```{r}
+table(lfile$col.attrs$Strain[])
+table(lfile$col.attrs$Species[])
+```
+
+```{r}
+zeisel.strain <- lfile$col.attrs$Strain[]
+```
+
+
+#### 2.2.7 Sequencing information
+```{r}
+head(lfile$col.attrs$`_Total`[])
+```
+
+```{r}
+summary(lfile$col.attrs$`_Total`[])
+```
+
+```{r}
+head(lfile$col.attrs$`Total Genes Detected`[])
+```
+`_Total` appears to refer to nUMI. `CreateSeuratObject` calculates this anyway, so we can leave this out.
+
+
+```{r}
+head(lfile$col.attrs$`_Valid`[])
+```
+
+```{r}
+table(lfile$col.attrs$`_Valid`[])
+```
+`_Valid` seems to be a flag of some sort. Not informative for us in this case since all of the values are 1.
+
+```{r}
+head(lfile$col.attrs$`Reads Mapped Confidently to Exonic Regions`[])
+```
+
+```{r}
+head(lfile$col.attrs$`Number of Reads`[])
+```
+Most cells are lacking metadata.
+
+
+### 2.3 Row data (genes)
+
+Check how many row attributes there are:
+```{r}
+length(lfile$row.attrs)
+```
+
+```{r}
+lfile[["row_attrs"]]
+```
+
+Fetch the gene names:
+```{r}
+zeisel.genes <- lfile$row.attrs$Gene[]
+length(zeisel.genes)
+head(zeisel.genes)
+```
+
+Fetch the Accession IDs:
+```{r}
+zeisel.geneIDs <- lfile$row.attrs$Accession[]
+length(zeisel.geneIDs)
+head(zeisel.geneIDs)
+```
+
+```{r}
+summary(lfile$row.attrs$`_Total`[])
+```
+
+```{r, fig.width=16}
+hist(log10(lfile$row.attrs$`_Total`[]+1), breaks = 100, ylim = c(0, 1000))
+abline(v = log10(5+1), col = "red")
+```
+Not sure what `_Total` actually is. We will not use it for now, and calculate anything we need from the expression matrix.
+
+## 3. Create Seurat object from Zeisel data
+
+### 3.1 Load the Seurat library
+```{r}
+library(Seurat)
+```
+
+### 3.2 Format the data and metadata
+
+#### 3.2.1 Convert the expression matrix into a data frame with the gene names and cell IDs
+```{r}
+zeisel.expr <- as.data.frame(x = zeisel.expr,
+                             row.names = zeisel.genes)
+colnames(zeisel.expr) <- zeisel.cellIDs
+```
+
+#### 3.2.2 Combine the metadata fields into a single table (cells x features)
+```{r}
+zeisel.metadata <- data.frame(zeisel.clusterNames, 
+                              zeisel.tissue,
+                              zeisel.region,
+                              zeisel.strain)
+rownames(zeisel.metadata) <- zeisel.cellIDs
+```
+
+#### 3.2.3 Filter genes
+
+Find the maximum UMIFM in a single cell for each gene:
+```{r}
+gene.max.UMI.per.cell <- as.data.frame(apply(zeisel.expr, 1, FUN = max))
+```
+
+```{r}
+summary(gene.max.UMI.per.cell)
+```
+
+```{r, fig.width=16}
+hist(log10(gene.max.UMI.per.cell+1), breaks = 100)
+abline(v = log10(5+1), col = "red")
+```
+
+Check how many genes pass different thresholds:
+```{r}
+sum(gene.max.UMI.per.cell > 0)
+sum(gene.max.UMI.per.cell > 1)
+sum(gene.max.UMI.per.cell > 2)
+```
+
+Set a threshold and filter the genes:
+```{r}
+gene.thresh <- 1
+zeisel.expr.filtered <- zeisel.expr[(gene.max.UMI.per.cell>gene.thresh),]
+dim(zeisel.expr.filtered)
+```
+
+### 3.3 Create the Seurat object
+```{r}
+zeisel.ob <- CreateSeuratObject(raw.data = zeisel.expr.filtered,
+                                meta.data = zeisel.metadata,
+                                min.cells = 1,
+                                min.genes = 0)
+zeisel.ob <- MakeSparse(object = zeisel.ob)
+dim(zeisel.ob@data)
+```
+
+```{r}
+rm(zeisel.expr)
+rm(zeisel.metadata)
+```
+
+```{r}
+colnames(zeisel.ob@meta.data)
+```
+
+```{r}
+zeisel.ob <- SetAllIdent(object = zeisel.ob,
+                         id = "zeisel.clusterNames")
+```
+
+```{r}
+table(zeisel.ob@ident)
+```
+
+### 3.4 Add additional metadata
+```{r}
+mito.genes <- grep("^mt-", rownames(zeisel.ob@data), value = TRUE)
+percent.mito <- Matrix::colSums(zeisel.ob@data[mito.genes, ])/Matrix::colSums(zeisel.ob@data)
+zeisel.ob <- AddMetaData(zeisel.ob, percent.mito, "percent.mito")
+rm(percent.mito)
+```
+Note that there are very minor differences in the gene names that will be inconvenient for merging the data without "fixes". To be more specific, the '-' symbols for many genes in our dataset, such as the mitochondrial genes, were changed to '.' by the Pyndrops pipeline.
+
+### 3.5 Check the QC metrics and their distributions
+```{r, fig.width=16}
+VlnPlot(object = zeisel.ob, 
+        features.plot = c("nGene", "nUMI", "percent.mito"), 
+        nCol = 1,
+        point.size.use = 0,
+        x.lab.rot = TRUE)
+```
+
+```{r}
+summary(zeisel.ob@meta.data$percent.mito)
+```
+
+```{r, fig.width=16}
+hist(zeisel.ob@meta.data$percent.mito, breaks = 100)
+```
+
+```{r}
+summary(zeisel.ob@meta.data$nUMI)
+```
+
+```{r, fig.width=16}
+hist(zeisel.ob@meta.data$nUMI, breaks = 100)
+```
+
+```{r}
+summary(zeisel.ob@meta.data$nGene)
+```
+
+```{r, fig.width=16}
+hist(zeisel.ob@meta.data$nGene, breaks = 100)
+```
+
+## 4. Save the Seurat object for later analysis
+```{r}
+saveRDS(object = zeisel.ob,
+        file = "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/zeisel_Seurat_cholinergic_monoaminergic_peptidergic.rds")
+```
+
+
+## Session Information
+
+Machine specifications:  
+
+* Mac Pro (Late 2013)  
+* macOS High Sierra 10.13.4  
+* 3.7 GHz Quad-Core Intel Xeon E5  
+* 64 GB 1866 MHz DDR3  
+* Java version "1.8.0_172"  
+
+```{r}
+devtools::session_info()
+```

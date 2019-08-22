@@ -1,0 +1,1210 @@
+---
+title: "DRN Cell Types Project: Comparison with Linnarsson Dataset - Unsupervised Clustering"
+output: 
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+author: "Kee Wui Huang, Sabatini Lab (Harvard Medical School)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+# Notebook Overiew
+This notebook is a part of a series that documents the review analysis for the DRN Cell Types project.
+
+This notebook contains the code used to perform unsupervised clustering on the 5-HT neurons in the scRNA-seq dataset from Zeisel et al. (2018). Clusters were then filtered and identified using similar methods used in the analysis of our DRN inDrop scRNA-seq dataset.
+
+
+# Analysis Workflow
+
+## 1. Initialize
+
+### 1.1 Load libraries
+```{r}
+library(devtools)
+library(useful)
+library(dplyr)
+library(ggplot2)
+library(reticulate)
+library(Seurat)
+library(stringr)
+library(Matrix)
+library(parallel)
+library(ape)
+```
+
+### 1.2 Load data
+```{r}
+wd <- "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/"
+dRaphe.neurons <- readRDS(file.path(wd, "DRN_inDrop_neurons.rds"))
+zeisel.ob <- readRDS(file.path(wd, "zeisel_Seurat_cholinergic_monoaminergic_peptidergic.rds"))
+dim(dRaphe.neurons@data)
+dim(zeisel.ob@data)
+```
+
+```{r}
+table(dRaphe.neurons@ident)
+table(zeisel.ob@ident)
+```
+
+### 1.3 Check and correct gene name differences
+```{r}
+huang.geneNames <- rownames(dRaphe.neurons@data)
+zeisel.geneNames <- rownames(zeisel.ob@data)
+length(huang.geneNames)
+length(zeisel.geneNames)
+length(intersect(huang.geneNames, zeisel.geneNames))
+```
+
+```{r}
+zeisel.geneNames.fix <- str_replace(string = zeisel.geneNames,
+                                    pattern = "-",
+                                    replacement = ".")
+length(intersect(huang.geneNames, zeisel.geneNames.fix))
+```
+
+```{r}
+is.element("mt.Co2", huang.geneNames) & is.element("mt.Co2", zeisel.geneNames.fix)
+```
+
+```{r}
+head(setdiff(huang.geneNames, zeisel.geneNames.fix), 10)
+```
+
+```{r}
+head(setdiff(zeisel.geneNames.fix, huang.geneNames), 10)
+```
+
+Fixing them now probably matters more for trying to merge and cluster the cells from both datasets together.
+
+We will find the intersection after separating out the 5-HT neurons from each dataset.
+
+
+## 2. Average the Zeisel data by cluster
+
+### 2.1 Subset the 5-HT neurons
+```{r}
+zeisel.ob.SER <- SubsetData(object = zeisel.ob,
+                            ident.use = c("HBSER1",
+                                          "HBSER2",
+                                          "HBSER3",
+                                          "HBSER4",
+                                          "HBSER5"),
+                            subset.raw = TRUE)
+dRaphe.neurons.5HT <- SubsetData(object = dRaphe.neurons,
+                            ident.use = c("5-HT-I",
+                                          "5-HT-II",
+                                          "5-HT-III",
+                                          "5-HT-IV",
+                                          "5-HT-V"),
+                            subset.raw = TRUE)
+dim(dRaphe.neurons.5HT@data)
+dim(zeisel.ob.SER@data)
+```
+
+```{r}
+summary(dRaphe.neurons.5HT@meta.data$nUMI)
+summary(zeisel.ob.SER@meta.data$nUMI)
+```
+
+```{r}
+summary(dRaphe.neurons.5HT@meta.data$nGene)
+summary(zeisel.ob.SER@meta.data$nGene)
+```
+
+```{r}
+dRaphe.neurons.5HT <- SubsetData(object = dRaphe.neurons,
+                                 ident.use = c("5-HT-I",
+                                               "5-HT-II",
+                                               "5-HT-III",
+                                               "5-HT-IV",
+                                               "5-HT-V"),
+                                 subset.raw = TRUE)
+dim(dRaphe.neurons.5HT@data)
+```
+
+### 2.2 Normalize the data
+```{r}
+zeisel.ob.SER <- NormalizeData(object = zeisel.ob.SER,
+                               normalization.method = "LogNormalize",
+                               scale.factor = 10000,
+                               display.progress = FALSE)
+dRaphe.neurons.5HT <- NormalizeData(object = dRaphe.neurons.5HT,
+                                    normalization.method = "LogNormalize",
+                                    scale.factor = 10000,
+                                    display.progress = FALSE)
+```
+
+### 2.3 Find the expressed genes in both subsets of 5-HT neurons
+```{r}
+huang.5HT.genes <- rownames(dRaphe.neurons.5HT@raw.data[(rowSums(as.matrix(dRaphe.neurons.5HT@raw.data))>0),])
+zeisel.5HT.genes <- rownames(zeisel.ob.SER@raw.data[(rowSums(as.matrix(zeisel.ob.SER@raw.data))>0),])
+genes.common <- intersect(huang.5HT.genes, zeisel.5HT.genes)
+length(genes.common)
+is.element("Tph2", genes.common)
+is.element("En1", genes.common)
+is.element("Fev", genes.common)
+is.element("Pdyn", genes.common)
+is.element("Trh", genes.common)
+is.element("Cbln2", genes.common)
+is.element("Met", genes.common)
+```
+
+### 2.4 Calculate cluster averages
+```{r}
+zeisel.cluster.SER.avg <- AverageExpression(object = zeisel.ob.SER,
+                                            genes.use = genes.common,
+                                            return.seurat = TRUE,
+                                            show.progress = FALSE)
+dim(zeisel.cluster.SER.avg@data)
+```
+
+```{r}
+huang.5HT.subtype.avg <- AverageExpression(object = dRaphe.neurons.5HT,
+                                           genes.use = genes.common,
+                                           return.seurat = TRUE,
+                                           show.progress = FALSE)
+dim(huang.5HT.subtype.avg@data)
+```
+
+```{r}
+dRaphe.neurons <- SetIdent(object = dRaphe.neurons,
+                           cells.use = WhichCells(object = dRaphe.neurons,
+                                                  ident = c("5-HT-I",
+                                                            "5-HT-II",
+                                                            "5-HT-III",
+                                                            "5-HT-IV",
+                                                            "5-HT-V")),
+                               ident.use = "5-HT")
+dRaphe.neurons <- SetIdent(object = dRaphe.neurons,
+                           cells.use = WhichCells(object = dRaphe.neurons,
+                                                  ident = c("DA-I",
+                                                            "DA-II",
+                                                            "DA-III")),
+                               ident.use = "DA")
+dRaphe.neurons <- SetIdent(object = dRaphe.neurons,
+                           cells.use = WhichCells(object = dRaphe.neurons,
+                                                  ident = c("GABA-I",
+                                                            "GABA-II",
+                                                            "GABA-III")),
+                               ident.use = "GABA")
+dRaphe.neurons <- SetIdent(object = dRaphe.neurons,
+                           cells.use = WhichCells(object = dRaphe.neurons,
+                                                  ident = c("Glu-I",
+                                                            "Glu-II",
+                                                            "Glu-III",
+                                                            "Glu-IV",
+                                                            "Glu-V")),
+                               ident.use = "Glu")
+dRaphe.neurons.avg <- AverageExpression(object = dRaphe.neurons,
+                                       genes.use = genes.common,
+                                       return.seurat = TRUE,
+                                       show.progress = FALSE)
+dim(dRaphe.neurons.avg@data)
+```
+
+Check correlation coefficients:
+```{r}
+cor(x = as.vector(dRaphe.neurons.avg@data[,"5-HT"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER1"]),
+    method = "pearson")
+cor(x = as.vector(dRaphe.neurons.avg@data[,"5-HT"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER2"]),
+    method = "pearson")
+cor(x = as.vector(dRaphe.neurons.avg@data[,"5-HT"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER3"]),
+    method = "pearson")
+cor(x = as.vector(dRaphe.neurons.avg@data[,"5-HT"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER4"]),
+    method = "pearson")
+cor(x = as.vector(dRaphe.neurons.avg@data[,"5-HT"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER5"]),
+    method = "pearson")
+```
+
+```{r}
+cor(x = as.vector(zeisel.cluster.SER.avg@data[,"HBSER1"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER2"]),
+    method = "pearson")
+cor(x = as.vector(zeisel.cluster.SER.avg@data[,"HBSER1"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER3"]),
+    method = "pearson")
+cor(x = as.vector(zeisel.cluster.SER.avg@data[,"HBSER1"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER4"]),
+    method = "pearson")
+cor(x = as.vector(zeisel.cluster.SER.avg@data[,"HBSER1"]), 
+    y = as.vector(zeisel.cluster.SER.avg@data[,"HBSER5"]),
+    method = "pearson")
+```
+Coefficients are all fairly high, probably because there are a lot of genes in common between all of the different 5-HT neuron clusters. Clustering the Zeisel dataset cells will probably be more informative.
+
+
+## 3. Cluster 5-HT neurons in Zeisel dataset separately
+
+### 3.1 Scale data
+```{r}
+zeisel.ob.SER <- ScaleData(object = zeisel.ob.SER,
+                           vars.to.regress = c("nUMI", "percent.mito"),
+                           model.use = "linear",
+                           do.scale = TRUE,
+                           scale.max = 10,
+                           do.center = TRUE,
+                           do.par = TRUE,
+                           num.cores = 4,
+                           display.progress = FALSE)
+```
+
+### 3.2 Find variable genes
+```{r, fig.width=10}
+zeisel.ob.SER <- FindVariableGenes(object = zeisel.ob.SER,
+                                   mean.function = ExpMean,
+                                   dispersion.function = LogVMR,
+                                   x.low.cutoff = 0.075,
+                                   x.high.cutoff = 4,
+                                   y.cutoff = 0.5,
+                                   num.bin = 100)
+```
+
+```{r}
+length(zeisel.ob.SER@var.genes)
+```
+
+### 3.3 PCA
+```{r}
+zeisel.ob.SER <- RunPCA(object = zeisel.ob.SER,
+                        pcs.compute = 30,
+                        pcs.print = NA,
+                        weight.by.var = FALSE)
+```
+
+```{r, fig.width=16}
+DimHeatmap(object = zeisel.ob.SER,
+           reduction.type = "pca",
+           cells.use = length(zeisel.ob.SER@cell.names),
+           dim.use = 1:9,
+           do.balanced = TRUE)
+DimHeatmap(object = zeisel.ob.SER,
+           reduction.type = "pca",
+           cells.use = length(zeisel.ob.SER@cell.names),
+           dim.use = 10:18,
+           do.balanced = TRUE)
+```
+
+```{r, fig.width=16}
+PCElbowPlot(object= zeisel.ob.SER, num.pc = 30)
+```
+
+```{r}
+zeisel.ob.SER <- JackStraw(object = zeisel.ob.SER,
+                           num.pc = 30,
+                           do.par = TRUE,
+                           num.cores = 4,
+                           display.progress = FALSE)
+```
+
+```{r, fig.width=16}
+JackStrawPlot(object = zeisel.ob.SER,
+              PCs = 1:30)
+```
+
+### 3.4 DR (UMAP)
+```{r}
+zeisel.ob.SER <- RunUMAP(object = zeisel.ob.SER,
+                         reduction.use = "pca",
+                         dims.use = 1:10,
+                         n_neighbors = 30L,
+                         min_dist = 0.5,
+                         metric = "correlation")
+```
+
+```{r, fig.width=16}
+DimPlot(object = zeisel.ob.SER,
+        reduction.use = "umap",
+        no.legend = TRUE,
+        do.label = TRUE,
+        pt.size = 3,
+        label.size = 10)
+```
+
+
+### 3.5 Check marker expression
+```{r, fig.width=16, fig.height=10}
+VlnPlot(object = zeisel.ob.SER,
+        features.plot = c("Slc6a4",
+                          "Tph2",
+                          "Fev",
+                          "Htr1a",
+                          "Slc22a3",
+                          "Maob"),
+        nCol = 1,
+        point.size.use = 0,
+        size.x.use = 5,
+        size.y.use = 5,
+        x.lab.rot = TRUE)
+VlnPlot(object = zeisel.ob.SER,
+        features.plot = c("En1",
+                          "En2",
+                          "Pou3f1",
+                          "Met",
+                          "Plxnb1",
+                          "Pnoc",
+                          "Htr2a"),
+        nCol = 1,
+        point.size.use = 0,
+        size.x.use = 5,
+        size.y.use = 5,
+        x.lab.rot = TRUE)
+```
+
+The R2-enriched gene *Hoxa2* was not detected.
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("nUMI", "Snap25", "En1",
+                              "Gabre", "Sema5a", "Kit",
+                              "Hrh3", "Slc17a8", "Arhgap36"),
+            cols.use = c("gray", "red"))
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Slc6a4", "Tph2", "Fev",
+                              "En1", "En2", "Pnoc",
+                              "Slc17a8", "Pdyn", "Prkcq"),
+            cols.use = c("gray", "red"))
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Trh", "Asb4", "Cbln2",
+                              "Gad1", "Gad2", "Tac1",
+                              "Nr2f2", "Cdh4", "Oxtr"),
+            cols.use = c("gray", "red"))
+```
+
+
+### 3.6 Clustering
+
+```{r}
+resolution.vector <- c(0.5, 0.6, 0.8, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8)
+nClusters <- rep(0, length(resolution.vector))
+oobe.max <- rep(0, length(resolution.vector))
+oobe.min <- rep(0, length(resolution.vector))
+oobe.mean <- rep(0, length(resolution.vector))
+
+for (i in 1:length(resolution.vector)) {
+  zeisel.ob.SER <- FindClusters(object = zeisel.ob.SER,
+                              reduction.type = "pca",
+                              dims.use = 1:10,
+                              resolution = resolution.vector[i],
+                              algorithm = 3,
+                              n.iter = 10,
+                              save.SNN = TRUE,
+                              force.recalc = TRUE,
+                              print.output = FALSE)
+  
+  # Average expression and build cluster tree
+  zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                               return.seurat = TRUE,
+                                               show.progress = FALSE)
+  d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+            method = "euclidean")
+  hc <- hclust(d, method = "ward.D2")
+  oldIDs <- hc$labels[hc$order]
+  newIDs <- c(1:length(levels(zeisel.ob.SER@ident)))
+  zeisel.ob.SER@ident <- plyr::mapvalues(x = zeisel.ob.SER@ident,
+                                          from = oldIDs,
+                                          to = newIDs)
+  level.order <- order(as.numeric(levels(zeisel.ob.SER@ident)))
+  zeisel.ob.SER@ident <- factor(x = zeisel.ob.SER@ident,
+                                 levels = levels(zeisel.ob.SER@ident)[level.order],
+                                 ordered = TRUE)
+  # Rebuild and store the cluster tree on the new identities
+  zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                               return.seurat = TRUE,
+                                               show.progress = FALSE)
+  d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+            method = "euclidean")
+  hc <- hclust(d, method = "ward.D2")
+  zeisel.ob.SER@cluster.tree[[1]] <- as.phylo(hc)
+  nodes.oobe <- AssessNodes(object = zeisel.ob.SER, 
+                            genes.training = zeisel.ob.SER@var.genes)
+  
+  nClusters[i] <- length(levels(zeisel.ob.SER@ident))
+  oobe.max[i] <- max(as.vector(nodes.oobe$oobe))
+  oobe.min[i] <- min(as.vector(nodes.oobe$oobe))
+  oobe.mean[i] <- mean(as.vector(nodes.oobe$oobe))
+}
+```
+
+```{r, fig.width=16}
+clusteringResults <- data.frame(resolution.vector,
+                                nClusters,
+                                oobe.min,
+                                oobe.max,
+                                oobe.mean)
+plot.nClusters <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = nClusters)) + geom_line() + geom_point()
+plot.oobe.min <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = oobe.min)) + geom_line() + geom_point()
+plot.oobe.max <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = oobe.max)) + geom_line() + geom_point()
+plot.oobe.mean <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = oobe.mean)) + geom_line() + geom_point()
+plot.list <- list(plot.nClusters,
+                  plot.oobe.min,
+                  plot.oobe.max,
+                  plot.oobe.mean)
+plot_grid(plotlist = plot.list, ncol = 2)
+```
+
+```{r, fig.width=16}
+zeisel.ob.SER <- FindClusters(object = zeisel.ob.SER,
+                              reduction.type = "pca",
+                              dims.use = 1:10,
+                              resolution = 1.5,
+                              algorithm = 3,
+                              n.iter = 10,
+                              save.SNN = TRUE,
+                              force.recalc = TRUE,
+                              print.output = FALSE)
+# Average expression and build cluster tree
+zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                             return.seurat = TRUE,
+                                             show.progress = FALSE)
+d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+          method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+oldIDs <- hc$labels[hc$order]
+newIDs <- c(1:length(levels(zeisel.ob.SER@ident)))
+zeisel.ob.SER@ident <- plyr::mapvalues(x = zeisel.ob.SER@ident,
+                                        from = oldIDs,
+                                        to = newIDs)
+level.order <- order(as.numeric(levels(zeisel.ob.SER@ident)))
+zeisel.ob.SER@ident <- factor(x = zeisel.ob.SER@ident,
+                               levels = levels(zeisel.ob.SER@ident)[level.order],
+                               ordered = TRUE)
+# Rebuild and store the cluster tree on the new identities
+zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                             return.seurat = TRUE,
+                                             show.progress = FALSE)
+d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+          method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+zeisel.ob.SER@cluster.tree[[1]] <- as.phylo(hc)
+```
+
+```{r, fig.width=16}
+PlotClusterTree(zeisel.ob.SER)
+```
+
+```{r, fig.width=16}
+p1 <- DimPlot(object = zeisel.ob.SER,
+              reduction.use = "umap",
+              no.legend = TRUE,
+              do.label = TRUE,
+              pt.size = 3,
+              label.size = 10,
+              do.return = TRUE)
+p2 <- DimPlot(object = zeisel.ob.SER,
+              reduction.use = "umap",
+              no.legend = TRUE,
+              do.label = TRUE,
+              pt.size = 3,
+              label.size = 10,
+              group.by = "zeisel.clusterNames",
+              do.return = TRUE)
+plot_grid(p1, p2)
+```
+
+```{r}
+nodes.oobe <- AssessNodes(zeisel.ob.SER, genes.training = zeisel.ob.SER@var.genes)
+nodes.oobe <- nodes.oobe[order(nodes.oobe$oobe, decreasing = TRUE),]
+nodes.oobe
+```
+
+```{r}
+nodes.oobe
+```
+
+
+```{r, fig.width=16, fig.height=10}
+VlnPlot(object = zeisel.ob.SER,
+        features.plot = c("nUMI",
+                          "Slc6a4",
+                          "Tph2",
+                          "Fev",
+                          "Htr1a",
+                          "Slc22a3",
+                          "Maob"),
+        nCol = 1,
+        point.size.use = 0,
+        size.x.use = 5,
+        size.y.use = 5,
+        x.lab.rot = TRUE)
+VlnPlot(object = zeisel.ob.SER,
+        features.plot = c("En1",
+                          "En2",
+                          "Pou3f1",
+                          "Met",
+                          "Plxnb1",
+                          "Pnoc",
+                          "Htr2a"),
+        nCol = 1,
+        point.size.use = 0,
+        size.x.use = 5,
+        size.y.use = 5,
+        x.lab.rot = TRUE)
+```
+
+```{r}
+table(zeisel.ob.SER@ident)
+```
+
+### 3.7 Find genes enriched in each cluster
+```{r}
+markers.cluster <- FindAllMarkers(object = zeisel.ob.SER,
+                                  test.use = "MAST",
+                                  only.pos = TRUE)
+markers.node <- FindAllMarkersNode(object = zeisel.ob.SER,
+                                   test.use = "MAST",
+                                   only.pos = FALSE)
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==1,], 100)
+```
+
+Cluster 1 is highly enriched in ribosomal genes, and the separation seems likely to be an artifact. Should also check DE genes at node #10.
+
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==2,], 50)
+```
+
+Cluster 2 is likely a part of R1DR (dorsal DRN).
+
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==3,], 50)
+```
+
+Cluster 3 is likely a part of R1DR (ventral DRN).
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==4,], 50)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Gpr101", "Trh", "Sst",
+                              "Penk", "Trhr", "Reln",
+                              "Ndnf", "Mc4r", "Pou3f2"),
+            cols.use = c("gray", "red"))
+```
+
+Cluster 4 gene expression matches the R6P cluster in Okaty et al. (2015).
+
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==5,], 50)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Mal", "Cryab", "Fa2h",
+                              "Kcnj10", "Enpp2", "Olig1",
+                              "Mog", "Kcna1", "Nkx6-2"),
+            cols.use = c("gray", "red"))
+```
+Cells in cluster 5 look a lot like putative doublets, given the high expression of genes typically found in glial cells (particularly oligodendrocyte genes).
+
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==6,], 50)
+```
+
+Cluster 6 is likely to be R1MR (or R1DR/R2).
+
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==7,], 50)
+```
+
+Cluster 7 cells are likely to be R5 cells.
+
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Pgr15l", "Tac1", "Shox2",
+                              "Chodl", "Nkx6-1", "Meis2",
+                              "Islr2", "Arhgap36", "Trh"),
+            cols.use = c("gray", "red"))
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==8,], 50)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Rorb", "Pcdh19", "Nr2f2",
+                              "Tcf4", "Foxp1", "Esr2",
+                              "Kit", "Sema5a", "Cntn3"),
+            cols.use = c("gray", "red"))
+```
+
+Cluster 8 is either R1MR or R2, likely R2 (MRN cells, either way).
+
+Check expression of R3-enriched genes:
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Egr2", "Samd9l", "Plxnb1",
+                              "Pdlim5", "Pcdh18", "Zfp560",
+                              "Trpc5", "Sstr1", "Cdh9"),
+            cols.use = c("gray", "red"))
+```
+
+It's possible that there aren't enough R3 cells in this dataset to detect.
+
+Check DRN 5-HT subtypes:
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("En1", "Adcy2", "Pdyn",
+                              "Slc17a8", "Cbln2", "Arhgap36",
+                              "Prkcq", "Gad1", "Trh"),
+            cols.use = c("gray", "red"))
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Hcrtr1", "Fbxo2", "Sorcs1",
+                              "Crhr2", "Rprm", "Asb4",
+                              "En2", "Trpc3", "Met"),
+            cols.use = c("gray", "red"))
+```
+
+### 3.8 Check DE genes by nodes (left vs. right)
+```{r}
+head(markers.node[markers.node$cluster==9,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==10,], 50)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Gabre", "Sema5a", "Gabrq",
+                              "Tac1", "Pou2f2", "Hrh3",
+                              "En1", "Amigo2", "Kit"),
+            cols.use = c("gray", "red"))
+```
+
+Cluster 1 seems to be a collection of cells from different clusters (mixed expression of genes in R1/R2/R3/R5/R6 cells) that share "high expression"" on ribosomal genes.
+
+
+```{r}
+head(markers.node[markers.node$cluster==14,], 50)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Slc17a8", "Slit2", "Pcdh11x",
+                              "Nos1", "Npy2r", "Crhr2",
+                              "Pcdh15", "Maf", "Ntng1"),
+            cols.use = c("gray", "red"))
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Hs3st4", "Asb4", "Prph",
+                              "Arhgap36", "Gad1", "Tmem176b",
+                              "Sdk2", "Hcrtr1", "Esm1"),
+            cols.use = c("gray", "red"))
+```
+
+Node 14 is probably a split between dorsal and ventral DRN.
+
+
+```{r}
+head(markers.node[markers.node$cluster==11,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==12,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==13,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==15,], 50)
+```
+
+### 3.9 Filter clusters and re-cluster
+```{r}
+zeisel.ob.SER <- SubsetData(object = zeisel.ob.SER,
+                            ident.remove = c(1, 5),
+                            subset.raw = TRUE)
+```
+
+```{r}
+resolution.vector <- c(0.5, 0.6, 0.8, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8)
+nClusters <- rep(0, length(resolution.vector))
+oobe.max <- rep(0, length(resolution.vector))
+oobe.min <- rep(0, length(resolution.vector))
+oobe.mean <- rep(0, length(resolution.vector))
+
+for (i in 1:length(resolution.vector)) {
+  zeisel.ob.SER <- FindClusters(object = zeisel.ob.SER,
+                              reduction.type = "pca",
+                              dims.use = 1:10,
+                              resolution = resolution.vector[i],
+                              algorithm = 3,
+                              n.iter = 10,
+                              save.SNN = TRUE,
+                              force.recalc = TRUE,
+                              print.output = FALSE)
+  
+  # Average expression and build cluster tree
+  zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                               return.seurat = TRUE,
+                                               show.progress = FALSE)
+  d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+            method = "euclidean")
+  hc <- hclust(d, method = "ward.D2")
+  oldIDs <- hc$labels[hc$order]
+  newIDs <- c(1:length(levels(zeisel.ob.SER@ident)))
+  zeisel.ob.SER@ident <- plyr::mapvalues(x = zeisel.ob.SER@ident,
+                                          from = oldIDs,
+                                          to = newIDs)
+  level.order <- order(as.numeric(levels(zeisel.ob.SER@ident)))
+  zeisel.ob.SER@ident <- factor(x = zeisel.ob.SER@ident,
+                                 levels = levels(zeisel.ob.SER@ident)[level.order],
+                                 ordered = TRUE)
+  # Rebuild and store the cluster tree on the new identities
+  zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                               return.seurat = TRUE,
+                                               show.progress = FALSE)
+  d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+            method = "euclidean")
+  hc <- hclust(d, method = "ward.D2")
+  zeisel.ob.SER@cluster.tree[[1]] <- as.phylo(hc)
+  nodes.oobe <- AssessNodes(object = zeisel.ob.SER, 
+                            genes.training = zeisel.ob.SER@var.genes)
+  
+  nClusters[i] <- length(levels(zeisel.ob.SER@ident))
+  oobe.max[i] <- max(as.vector(nodes.oobe$oobe))
+  oobe.min[i] <- min(as.vector(nodes.oobe$oobe))
+  oobe.mean[i] <- mean(as.vector(nodes.oobe$oobe))
+}
+```
+
+```{r, fig.width=16}
+clusteringResults <- data.frame(resolution.vector,
+                                nClusters,
+                                oobe.min,
+                                oobe.max,
+                                oobe.mean)
+plot.nClusters <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = nClusters)) + geom_line() + geom_point()
+plot.oobe.min <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = oobe.min)) + geom_line() + geom_point()
+plot.oobe.max <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = oobe.max)) + geom_line() + geom_point()
+plot.oobe.mean <- ggplot(data = clusteringResults,
+                         aes(x = resolution.vector,
+                             y = oobe.mean)) + geom_line() + geom_point()
+plot.list <- list(plot.nClusters,
+                  plot.oobe.min,
+                  plot.oobe.max,
+                  plot.oobe.mean)
+plot_grid(plotlist = plot.list, ncol = 2)
+```
+
+
+```{r}
+zeisel.ob.SER <- FindClusters(object = zeisel.ob.SER,
+                              reduction.type = "pca",
+                              dims.use = 1:10,
+                              resolution = 1.1,
+                              algorithm = 3,
+                              n.iter = 10,
+                              save.SNN = TRUE,
+                              force.recalc = TRUE,
+                              print.output = FALSE)
+# Average expression and build cluster tree
+zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                             return.seurat = TRUE,
+                                             show.progress = FALSE)
+d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+          method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+oldIDs <- hc$labels[hc$order]
+newIDs <- c(1:length(levels(zeisel.ob.SER@ident)))
+zeisel.ob.SER@ident <- plyr::mapvalues(x = zeisel.ob.SER@ident,
+                                        from = oldIDs,
+                                        to = newIDs)
+level.order <- order(as.numeric(levels(zeisel.ob.SER@ident)))
+zeisel.ob.SER@ident <- factor(x = zeisel.ob.SER@ident,
+                               levels = levels(zeisel.ob.SER@ident)[level.order],
+                               ordered = TRUE)
+# Rebuild and store the cluster tree on the new identities
+zeisel.ob.SER.averages <- AverageExpression(object = zeisel.ob.SER, 
+                                             return.seurat = TRUE,
+                                             show.progress = FALSE)
+d <- dist(x = t(zeisel.ob.SER.averages@scale.data), 
+          method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+zeisel.ob.SER@cluster.tree[[1]] <- as.phylo(hc)
+```
+
+```{r, fig.width=16}
+PlotClusterTree(zeisel.ob.SER)
+```
+
+```{r}
+zeisel.ob.SER <- RunUMAP(object = zeisel.ob.SER,
+                         reduction.use = "pca",
+                         dims.use = 1:10,
+                         n_neighbors = 30L,
+                         min_dist = 0.5,
+                         metric = "correlation")
+```
+
+```{r, fig.width=16}
+p1 <- DimPlot(object = zeisel.ob.SER,
+              reduction.use = "umap",
+              no.legend = TRUE,
+              do.label = TRUE,
+              pt.size = 3,
+              label.size = 10,
+              do.return = TRUE)
+p2 <- DimPlot(object = zeisel.ob.SER,
+              reduction.use = "umap",
+              no.legend = TRUE,
+              do.label = TRUE,
+              pt.size = 3,
+              label.size = 10,
+              group.by = "zeisel.clusterNames",
+              do.return = TRUE)
+plot_grid(p1, p2)
+```
+
+```{r, fig.width=16}
+p1
+```
+
+```{r, fig.width=16}
+# QC, 5-HT markers
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("nUMI", "percent.mito", "Ddc",
+                              "Slc18a2", "Tph2", "Slc6a4",
+                              "Maob", "Slc22a3", "Qdpr"),
+            cols.use = c("gray", "red"))
+# Zeisel et al. (2018), HBSER4 vs. HBSER5
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Lat2", "Gpr101", "Penk",
+                              "Trh", "Sst", "Calcr",
+                              "Shox2", "Chodl", "Prkcq"),
+            cols.use = c("gray", "red"))
+# Zeisel et al. (2018), HBSER1 vs. HBSER3
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Satb2", "Nbl1", "Satb2",
+                              "Lrrk1", "Wfdc12", "Kit",
+                              "Kcns1", "Col25a1", "Il1r1"),
+            cols.use = c("gray", "red"))
+# Zeisel et al. (2018), HBSER2
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Sostdc1", "Rasgrp1", "Gata3",
+                              "Htr5b", "Sox1", "Pcsk5",
+                              "Hs6st2", "Mbp", "Nos1"),
+            cols.use = c("gray", "red"))
+# R1-DR
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("En1", "En2", "Satb2",
+                              "Npy2r", "Pax5", "Rspo3",
+                              "Foxa1", "Pcsk6", "Prph"),
+            cols.use = c("gray", "red"))
+# R1-DR, dorsal/lateral vs. ventral/midline
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Asb4", "Gad1", "Prkcq",
+                              "Trh", "Hcrtr1", "Pdyn",
+                              "Rprm", "Slc17a8", "Cbln2"),
+            cols.use = c("gray", "red"))
+# R1-MR
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Sox1", "Rorb", "Chrm2",
+                              "Trpc5", "Esr2", "Epha4",
+                              "Ppp1r17", "Pkd2l1", "Col19a1"),
+            cols.use = c("gray", "red"))
+# R2
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Rorb", "Pcdh19", "Nr2f2",
+                              "Tcf4", "Foxp1", "Met",
+                              "Kit", "Sema5a", "Cntn3"),
+            cols.use = c("gray", "red"))
+#R5
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Chodl", "Shox2", "Meis2",
+                              "Tac1", "Nkx6-1", "Grm4",
+                              "Pnoc", "Perp", "Islr2"),
+            cols.use = c("gray", "red"))
+# R6P
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Gpr101", "Sst", "Penk",
+                              "Trhr", "Reln", "Ndnf",
+                              "Mc4r", "Pou3f2", "Trh"),
+            cols.use = c("gray", "red"))
+```
+
+There appear to be additional subsets within clusters 2 and 3. We will explore this later, and go with the larger grouping for now and assign cluster identities by rhombomeres.
+
+
+```{r}
+nodes.oobe <- AssessNodes(zeisel.ob.SER, genes.training = zeisel.ob.SER@var.genes)
+nodes.oobe <- nodes.oobe[order(nodes.oobe$oobe, decreasing = TRUE),]
+nodes.oobe
+```
+
+Find genes enriched in each cluster
+```{r}
+markers.cluster <- FindAllMarkers(object = zeisel.ob.SER,
+                                  test.use = "MAST",
+                                  only.pos = TRUE)
+markers.node <- FindAllMarkersNode(object = zeisel.ob.SER,
+                                   test.use = "MAST",
+                                   only.pos = FALSE)
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==1,], 50)
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==2,], 50)
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==3,], 50)
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==4,], 50)
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==5,], 50)
+```
+
+```{r}
+head(markers.cluster[markers.cluster$cluster==6,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==7,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==8,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==9,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==10,], 50)
+```
+
+```{r}
+head(markers.node[markers.node$cluster==11,], 50)
+```
+
+Could not find any cells/clusters corresponding to R3 in this dataset.
+
+Cluster 2 looks very similar to clusters 5 and 6. Compare cluster 2 vs. 5 & 6:
+```{r}
+markers.compare <- FindMarkers(object = zeisel.ob.SER,
+                               ident.1 = 2,
+                               ident.2 = c(5, 6),
+                               test.use = "MAST",
+                               only.pos = FALSE)
+```
+
+```{r}
+head(markers.compare, 50)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Eef1a1", "Rpl41", "Rps19",
+                              "Rpl23a", "Rpl37a", "Rps28",
+                              "Tmsb10", "mt-Co1", "Rps29"),
+            cols.use = c("gray", "red"))
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Cldn11", "Ptges3", "Elmod1",
+                              "Gprasp2", "St13", "Nptn",
+                              "Gmps", "Xist", "Klhl9"),
+            cols.use = c("gray", "red"))
+```
+
+Check other R1-MR vs. R1-DR genes:
+```{r, fig.width=16}
+FeaturePlot(object = zeisel.ob.SER,
+            reduction.use = "umap",
+            features.plot = c("Npy1r", "Sox14", "Epha4",
+                              "Col14a1", "Robo1", "Ret",
+                              "Sema3e", "Cxcl14", "Klhl14"),
+            cols.use = c("gray", "red"))
+```
+
+```{r, fig.width=16, fig.height=10}
+VlnPlot(object = zeisel.ob.SER,
+        features.plot = c("nUMI",
+                          "nGene",
+                          "percent.mito",
+                          "Xist",
+                          "Tph2"),
+        nCol = 1,
+        point.size.use = 0,
+        size.x.use = 12,
+        size.y.use = 5,
+        x.lab.rot = FALSE)
+```
+
+Clusters 5 and 6 appear to be similar to cluster 2, with the separation being driven by differences that are likely to be technical or batch effects. However, there is insufficient metadata to examine this or to try and regress out these effects. It is possible that the HBSER1 cluster is separated from the other 5-HT neuron clusters in the Zeisel et al. (2018) dataset due to the same technical artifacts.
+
+Cluster 2 appears to be a mixture of various R1 neurons (mostly R1-DR), while cluster 4 contains several MRN 5-HT neuron types that include both R1-MR and R2 neurons. It is unclear if there are any R3 neurons in this cluster, since we cannot detect cells expressing R3-enriched genes.
+
+
+```{r}
+table(zeisel.ob.SER@ident)
+```
+
+```{r}
+zeisel.ob.SER <- StashIdent(object = zeisel.ob.SER,
+                            save.name = "clusterNumbers_filtered")
+```
+
+### 3.10 Re-name clusters
+```{r}
+ids.current <- levels(zeisel.ob.SER@ident)
+ids.rhombomere <- c("R6P (ROb/RPa)",  #1
+                    "R1 (DRN)",  #2 -- probably R1-DR
+                    "R5 (RMg)",  #3
+                    "R1/R2 (MRN)",  #4 -- at least R1-MR and R2
+                    "R1 (lateral DRN)",  #5
+                    "R1 (medial DRN)")  #6
+zeisel.ob.SER@ident <- plyr::mapvalues(x = zeisel.ob.SER@ident,
+                                        from = ids.current,
+                                        to = ids.rhombomere)
+zeisel.ob.SER <- StashIdent(object = zeisel.ob.SER,
+                            save.name = "clusterNames_byRhombomere")
+```
+
+```{r, fig.width=16}
+p1 <- DimPlot(object = zeisel.ob.SER,
+              reduction.use = "umap",
+              no.legend = TRUE,
+              do.label = TRUE,
+              pt.size = 3,
+              label.size = 6,
+              do.return = TRUE)
+p2 <- DimPlot(object = zeisel.ob.SER,
+              reduction.use = "umap",
+              no.legend = TRUE,
+              do.label = TRUE,
+              pt.size = 3,
+              label.size = 6,
+              group.by = "zeisel.clusterNames",
+              do.return = TRUE)
+plot_grid(p1, p2)
+```
+
+```{r}
+table(zeisel.ob.SER@ident)
+```
+
+## 4. Save the object with current labels
+```{r}
+saveRDS(object = zeisel.ob.SER,
+        file = "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/zeisel_Seurat_HBSER_clustered_filtered.rds")
+```
+
+
+## 5. Check distribution of `MitoRiboRatio`
+```{r}
+library(loomR)
+```
+
+```{r}
+lfile <- connect(filename = "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/l6_r3_cholinergic_monoaminergic_and_peptidergic_neurons.loom")
+lfile
+```
+
+```{r, fig.width=16}
+hist(log2(lfile$col.attrs$MitoRiboRatio[]+1), breaks = 100)
+```
+
+Looks similar to the distribution of `percent.mito`. Might be worth adding this in and trying to include it as a latent variable to see if we can remove the effects driving the separation of cluster 2 from 5 and 6.
+
+```{r}
+lfile$close_all()
+```
+
+
+# Summary & Conclusions
+
+The dataset from Zeisel et al. (2018) might not serve as a sutiable "reference" dataset for comparing with our inDrop scRNA-seq dataset for the following reasons:  
+
+* 5-HT neurons in the Zeisel dataset come from multiple serotonergic nuclei, not only the dorsal raphe.  
+
+* The clustering of 5-HT neurons by Zeisel et al. does not match the 5-HT neuron subsets described in Okaty et al. (2015), and re-clustering on the 5-HT neurons alone shows that the HBSER1-5 clusters are likely to be a mixture of 5-HT neuron types when categorized by their developmental lineage (also explaining the unusual list of DE genes in the Zeisel et al. data portal).  
+
+* There appear to be several sources of technical variation or batch effects that drive the separation of clusters that are most similar to R1-DR cells, but there is insufficient metadata to understand the sources of these artifacts.  
+
+* There are only 118 DRN 5-HT neurons (R1-DR) remaining if we exclude cells that are putative doublets or clustered by technical artifacts, which is a much smaller sample size than our inDrop dataset.  
+
+* The data from Okaty et al. (2015) will make for a better "reference", although most of the data was obtained using bulk RNA-seq of the sorted/hand-picked cells, with a much smaller single-cell dataset.  
+
+However, the results of clustering the 5-HT neurons in the Zeisel et al. (2018) dataset already show some agreement with the findings we have made from our scRNA-seq data -- the R1-DR neurons in the Zeisel et al. (2018) dataset also separate into 2 distinct groups that each have additional heterogeneity within them, which appears to be similar to the separation that we see between the 5-HT-I/II and 5-HT-III/IV groups.  
+
+Few cells in this dataset were found to be *Met*^+^, and appear in both the R1 (medial DRN) cluster and the MRN (R1/R2) cluster. These cells are probably similar to the 5-HT-V subtype, although it is difficult to determine if any of these *Met*^+^ cells are actually in the DRN baed on the transcriptomic data alone.  
+
+
+## Session Information
+
+Machine specifications:  
+
+* Mac Pro (Late 2013)  
+* macOS High Sierra 10.13.4  
+* 3.7 GHz Quad-Core Intel Xeon E5  
+* 64 GB 1866 MHz DDR3  
+* Java version "1.8.0_172"  
+
+```{r}
+devtools::session_info()
+```

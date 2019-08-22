@@ -1,0 +1,513 @@
+---
+title: "DRN Cell Types Project: Co-Clustering"
+output: 
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+author: "Kee Wui Huang, Sabatini Lab (Harvard Medical School)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+# Notebook Overiew
+This notebook is a part of a series that documents the review analysis for the DRN Cell Types project.
+
+This notebook contains the code used to co-cluster the DRN 5-HT neurons in the Zeisel et al. (2018) dataset with our DRN 5-HT neuronal subset. We will exclude the Okaty et al. (2015) cells since there are only 8 cells in that dataset.
+
+
+# Analysis Workflow
+
+## 1. Initialize
+
+### 1.1 Load libraries
+```{r}
+library(devtools)
+library(useful)
+library(dplyr)
+library(ggplot2)
+library(reticulate)
+library(Seurat)
+library(stringr)
+library(Matrix)
+library(parallel)
+library(ape)
+```
+
+### 1.2 Load datasets
+```{r}
+wd <- "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/"
+dRaphe.neurons <- readRDS(file.path(wd, "DRN_inDrop_neurons.rds"))
+dRaphe.neurons.5HT <- SubsetData(object = dRaphe.neurons,
+                            ident.use = c("5-HT-I",
+                                          "5-HT-II",
+                                          "5-HT-III",
+                                          "5-HT-IV",
+                                          "5-HT-V"),
+                            subset.raw = TRUE)
+dim(dRaphe.neurons.5HT@data)
+
+zeisel.ob.SER <- readRDS(file.path(wd, "zeisel_Seurat_HBSER_clustered_filtered.rds"))
+dim(zeisel.ob.SER@data)
+```
+
+### 1.3 Subset the R1DR cells from the Zeisel dataset
+
+We will get the cell names from the clustered Zeisel object, but take the count data from the loom file and use the same genes from the inDrop dataset.
+
+Get the cell names:
+```{r}
+zeisel.R1DR.cellnames <- WhichCells(object = zeisel.ob.SER,
+                                    ident = c("R1 (medial DRN)",
+                                              "R1 (lateral DRN)"))
+```
+
+Get the R1DR cells from the count matrix:
+```{r}
+library(loomR)
+lfile <- connect(filename = "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/l6_r3_cholinergic_monoaminergic_and_peptidergic_neurons.loom")
+zeisel.expr <- lfile$matrix[,]
+zeisel.expr <- t(zeisel.expr)
+zeisel.cellIDs <- lfile$col.attrs$CellID[]
+zeisel.genes <- lfile$row.attrs$Gene[]
+zeisel.genes.fix <- str_replace(string = zeisel.genes,
+                                pattern = "-",
+                                replacement = ".")
+zeisel.expr <- as.data.frame(x = zeisel.expr,
+                             row.names = zeisel.genes.fix)
+colnames(zeisel.expr) <- zeisel.cellIDs
+lfile$close_all()
+```
+
+```{r}
+zeisel.expr.R1DR <- zeisel.expr[,zeisel.R1DR.cellnames]
+dim(zeisel.expr.R1DR)
+```
+
+
+## 2. CCA-based merging of scRNA-seq data
+
+We will only use cells in each dataset that are from the DRN and exclude 5-HT neurons from other structures/rhombomeres for this analysis. This should allow us to see if subtypes that we have identified in our dataset are also present in these other datasets.
+
+
+### 2.1 Use the same genes in both datasets
+```{r}
+huang.genes <- rownames(dRaphe.neurons.5HT@data)
+sum(is.element(huang.genes, zeisel.genes.fix))
+```
+
+```{r}
+head(huang.genes[!is.element(huang.genes, zeisel.genes.fix)],100)
+tail(huang.genes[!is.element(huang.genes, zeisel.genes.fix)],100)
+```
+
+Use the intersection:
+```{r}
+genes.use <- huang.genes[is.element(huang.genes, zeisel.genes.fix)]
+length(genes.use)
+```
+
+Subset genes for both datasets:
+```{r}
+zeisel.expr.R1DR <- zeisel.expr.R1DR[genes.use,]
+dim(zeisel.expr.R1DR)
+```
+
+```{r}
+huang.expr <- as.matrix(dRaphe.neurons.5HT@raw.data)
+huang.expr <- huang.expr[genes.use,]
+dim(huang.expr)
+```
+
+
+### 2.2 Generate Seurat objects for each dataset
+
+#### 2.2.1 Initialize objects
+```{r}
+huang.metadata <- dRaphe.neurons.5HT@meta.data[,c("BatchID", "Sex", "subtypeIDs")]
+colnames(huang.metadata) <- c("BatchID", "Sex", "orig.clusterNames")
+huang.metadata$BatchID <- as.factor(huang.metadata$BatchID)
+
+zeisel.metadata <- as.data.frame(matrix(data = NA, 
+                                        nrow = length(zeisel.R1DR.cellnames),
+                                        ncol = 2),
+                                 row.names = zeisel.R1DR.cellnames)
+zeisel.metadata <- cbind(zeisel.metadata,
+                         zeisel.ob.SER@meta.data[zeisel.R1DR.cellnames, c("zeisel.clusterNames")])
+colnames(zeisel.metadata) <- c("BatchID", "Sex", "orig.clusterNames")
+zeisel.metadata$BatchID <- as.factor(zeisel.metadata$BatchID)
+zeisel.metadata$Sex <- as.factor(zeisel.metadata$Sex)
+```
+
+```{r}
+huang.ob <- CreateSeuratObject(raw.data = huang.expr,
+                               meta.data = huang.metadata,
+                               project = "Huang_inDrops",
+                               min.cells = 0,
+                               min.genes = 0,
+                               scale.factor = 10000)
+zeisel.ob <- CreateSeuratObject(raw.data = zeisel.expr.R1DR,
+                                meta.data = zeisel.metadata,
+                                project = "Zeisel_10X",
+                                min.cells = 0,
+                                min.genes = 0,
+                                scale.factor = 10000)
+```
+
+```{r}
+mito.genes <- grep("^mt.", rownames(huang.ob@data), value = TRUE)
+
+percent.mito <- Matrix::colSums(huang.ob@data[mito.genes, ])/Matrix::colSums(huang.ob@data)
+huang.ob <- AddMetaData(huang.ob, percent.mito, "percent.mito")
+
+percent.mito <- Matrix::colSums(zeisel.ob@data[mito.genes, ])/Matrix::colSums(zeisel.ob@data)
+zeisel.ob <- AddMetaData(zeisel.ob, percent.mito, "percent.mito")
+
+rm(percent.mito)
+```
+
+#### 2.2.2 Normalize and scale data
+```{r}
+huang.ob <- NormalizeData(object = huang.ob,
+                          normalization.method = "LogNormalize",
+                          scale.factor = 10000,
+                          display.progress = FALSE)
+zeisel.ob <- NormalizeData(object = zeisel.ob,
+                           normalization.method = "LogNormalize",
+                           scale.factor = 10000,
+                           display.progress = FALSE)
+
+huang.ob <- ScaleData(object = huang.ob,
+                      vars.to.regress = c("nUMI", "percent.mito", "BatchID"),
+                      model.use = "linear",
+                      do.scale = TRUE,
+                      scale.max = 10,
+                      do.center = TRUE,
+                      do.par = TRUE,
+                      num.cores = 4,
+                      display.progress = FALSE)
+zeisel.ob <- ScaleData(object = zeisel.ob,
+                       vars.to.regress = c("nUMI", "percent.mito"),
+                       model.use = "linear",
+                       do.scale = TRUE,
+                       scale.max = 10,
+                       do.center = TRUE,
+                       do.par = TRUE,
+                       num.cores = 4,
+                       display.progress = FALSE)
+```
+
+
+### 2.3 Run multi-dataset CCA and align datasets into a merged object
+
+#### 2.3.1 Find highly variable genes (HVGs) in each dataset
+```{r, fig.width=10}
+huang.ob <- FindVariableGenes(object = huang.ob,
+                              mean.function = ExpMean,
+                              dispersion.function = LogVMR,
+                              x.low.cutoff = 0.075,
+                              x.high.cutoff = 4,
+                              y.cutoff = 0.5,
+                              num.bin = 100)
+length(huang.ob@var.genes)
+
+zeisel.ob <- FindVariableGenes(object = zeisel.ob,
+                              mean.function = ExpMean,
+                              dispersion.function = LogVMR,
+                              x.low.cutoff = 0.075,
+                              x.high.cutoff = 4,
+                              y.cutoff = 0.5,
+                              num.bin = 100)
+length(zeisel.ob@var.genes)
+```
+
+#### 2.3.2 Find HVGs
+```{r}
+hvgs <- union(huang.ob@var.genes, zeisel.ob@var.genes)
+length(hvgs)
+```
+
+
+#### 2.3.2 Run CCA
+```{r}
+huang.ob@meta.data$dataset <- "Huang"
+zeisel.ob@meta.data$dataset <- "Zeisel"
+combined.ob <- RunCCA(object = huang.ob,
+                      object2 = zeisel.ob,
+                      genes.use = hvgs,
+                      num.cc = 30,
+                      scale.data = TRUE)
+```
+
+#### 2.3.3 Visualize and select CVs
+```{r, fig.width=10}
+for (i in 1:10) {
+  DimHeatmap(object = combined.ob,
+             reduction.type = "cca",
+             cells.use = 200,
+             dim.use = (3*(i-1)+1):(3*i),
+             do.balanced = TRUE)
+}
+```
+
+```{r, fig.width=16}
+MetageneBicorPlot(object = combined.ob, 
+                  grouping.var = "dataset", 
+                  dims.eval = 1:30,
+                  display.progress = FALSE)
+```
+
+#### 2.3.4 Subspace alignment
+```{r}
+combined.ob <- AlignSubspace(object = combined.ob,
+                             reduction.type = "cca",
+                             grouping.var = "dataset",
+                             dims.align = 1:7,
+                             verbose = FALSE)
+```
+
+```{r, fig.width=16}
+VlnPlot(object = combined.ob,
+        features.plot = c("CC1", "ACC1", "CC2", "ACC2",
+                          "CC3", "ACC3", "CC4", "ACC4"),
+        nCol = 4,
+        group.by = "dataset",
+        point.size.use = 0)
+```
+
+
+### 3. Clustering & DR
+
+#### 3.1 UMAP on aligned CVs
+```{r}
+combined.ob <- RunUMAP(object = combined.ob,
+                       reduction.use = "cca.aligned",
+                       dims.use = 1:7,
+                       n_neighbors = 30L,
+                       min_dist = 0.1,
+                       metric = "correlation")
+```
+
+Re-label cells by dataset + cluster names:
+```{r}
+huang.cellnames.I <- WhichCells(object = dRaphe.neurons.5HT,
+                                ident = "5-HT-I")
+huang.cellnames.II <- WhichCells(object = dRaphe.neurons.5HT,
+                                ident = "5-HT-II")
+huang.cellnames.III <- WhichCells(object = dRaphe.neurons.5HT,
+                                ident = "5-HT-III")
+huang.cellnames.IV <- WhichCells(object = dRaphe.neurons.5HT,
+                                ident = "5-HT-IV")
+huang.cellnames.V <- WhichCells(object = dRaphe.neurons.5HT,
+                                ident = "5-HT-V")
+
+zeisel.cellnames.l <- WhichCells(object = zeisel.ob.SER,
+                                ident = "R1 (lateral DRN)")
+zeisel.cellnames.m <- WhichCells(object = zeisel.ob.SER,
+                                ident = "R1 (medial DRN)")
+
+combined.ob <- SetIdent(object = combined.ob,
+                        cells.use = huang.cellnames.I,
+                        ident.use = "Huang_5-HT-I")
+combined.ob <- SetIdent(object = combined.ob,
+                        cells.use = huang.cellnames.II,
+                        ident.use = "Huang_5-HT-II")
+combined.ob <- SetIdent(object = combined.ob,
+                        cells.use = huang.cellnames.III,
+                        ident.use = "Huang_5-HT-III")
+combined.ob <- SetIdent(object = combined.ob,
+                        cells.use = huang.cellnames.IV,
+                        ident.use = "Huang_5-HT-IV")
+combined.ob <- SetIdent(object = combined.ob,
+                        cells.use = huang.cellnames.V,
+                        ident.use = "Huang_5-HT-V")
+combined.ob <- SetIdent(object = combined.ob,
+                        cells.use = zeisel.cellnames.l,
+                        ident.use = "Zeisel_R1DR-lateral")
+combined.ob <- SetIdent(object = combined.ob,
+                        cells.use = zeisel.cellnames.m,
+                        ident.use = "Zeisel_R1DR-medial")
+```
+
+```{r, fig.width=16}
+p1 <- DimPlot(object = combined.ob,
+             reduction.use = "umap",
+             do.label = FALSE,
+             no.legend = FALSE,
+             pt.size = 3,
+             group.by = "dataset",
+             do.return = TRUE)
+p2 <- DimPlot(object = combined.ob,
+             reduction.use = "umap",
+             do.label = FALSE,
+             no.legend = FALSE,
+             pt.size = 3,
+             do.return = TRUE)
+plot_grid(p1, p2)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = combined.ob,
+            nCol = 4,
+            reduction.use = "umap",
+            features.plot = c("Slc6a4", "Tph2", "Fev", "En1",
+                              "Prkcq", "Asb4", "Hcrtr1", "Trh",
+                              "Pdyn", "Slc17a8", "Cbln2", "Met"),
+            cols.use = c("gray", "red"),
+            no.legend = FALSE,
+            pt.size = 1)
+```
+
+
+#### 3.2 Try PCA
+```{r}
+combined.ob <- RunPCA(object = combined.ob,
+                      pc.genes = hvgs,
+                      pcs.compute = 30,
+                      weight.by.var = FALSE,
+                      pcs.print = NA)
+```
+
+```{r, fig.width=10}
+for (i in 1:10) {
+  DimHeatmap(object = combined.ob,
+             reduction.type = "pca",
+             cells.use = 200,
+             dim.use = (3*(i-1)+1):(3*i),
+             do.balanced = TRUE)
+}
+```
+
+```{r, fig.width=16}
+PCElbowPlot(object = combined.ob,
+            num.pc = 30)
+```
+
+```{r}
+combined.ob <- RunUMAP(object = combined.ob,
+                       reduction.use = "pca",
+                       dims.use = 1:11,
+                       n_neighbors = 30L,
+                       min_dist = 0.1,
+                       metric = "correlation")
+```
+
+```{r, fig.width=16}
+p3 <- DimPlot(object = combined.ob,
+             reduction.use = "umap",
+             do.label = FALSE,
+             no.legend = FALSE,
+             pt.size = 3,
+             group.by = "dataset",
+             do.return = TRUE)
+p4 <- DimPlot(object = combined.ob,
+             reduction.use = "umap",
+             do.label = FALSE,
+             no.legend = FALSE,
+             pt.size = 3,
+             do.return = TRUE)
+plot_grid(p3, p4)
+```
+
+```{r, fig.width=16}
+p3b <- DimPlot(object = combined.ob,
+             reduction.use = "umap",
+             do.label = FALSE,
+             no.legend = FALSE,
+             pt.size = 3,
+             group.by = "BatchID",
+             do.return = TRUE)
+plot_grid(p3, p3b)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = combined.ob,
+            nCol = 4,
+            reduction.use = "umap",
+            features.plot = c("Slc6a4", "Tph2", "Fev", "En1",
+                              "Prkcq", "Asb4", "Hcrtr1", "Trh",
+                              "Pdyn", "Slc17a8", "Cbln2", "Met"),
+            cols.use = c("gray", "red"),
+            no.legend = FALSE,
+            pt.size = 1)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = combined.ob,
+            nCol = 4,
+            reduction.use = "umap",
+            features.plot = c("nUMI", "nGene", "percent.mito", "Snap25",
+                              "PC1", "PC2", "PC3", "PC4",
+                              "PC5", "PC6", "PC7", "PC8"),
+            cols.use = c("gray", "red"),
+            no.legend = FALSE,
+            pt.size = 1)
+```
+
+Try running UMAP but now excluding PCs 1:3 -- likely related to batch effects separating datasets and batches.
+```{r}
+combined.ob <- RunUMAP(object = combined.ob,
+                       reduction.use = "pca",
+                       dims.use = 4:10,
+                       n_neighbors = 30L,
+                       min_dist = 0.1,
+                       metric = "correlation")
+```
+
+```{r, fig.width=16}
+p5 <- DimPlot(object = combined.ob,
+             reduction.use = "umap",
+             do.label = FALSE,
+             no.legend = FALSE,
+             pt.size = 3,
+             group.by = "dataset",
+             do.return = TRUE)
+p6 <- DimPlot(object = combined.ob,
+             reduction.use = "umap",
+             do.label = FALSE,
+             no.legend = FALSE,
+             pt.size = 3,
+             do.return = TRUE)
+plot_grid(p5, p6)
+```
+
+```{r, fig.width=16}
+plot_grid(p4, p6)
+```
+
+```{r, fig.width=16}
+plot_grid(p2, p6)
+```
+
+```{r, fig.width=16}
+FeaturePlot(object = combined.ob,
+            nCol = 4,
+            reduction.use = "umap",
+            features.plot = c("Slc6a4", "Tph2", "Fev", "En1",
+                              "Prkcq", "Asb4", "Hcrtr1", "Trh",
+                              "Pdyn", "Slc17a8", "Cbln2", "Met"),
+            cols.use = c("gray", "red"),
+            no.legend = FALSE,
+            pt.size = 1)
+```
+
+Zeisel R1DR neurons are appearing in the different subtype clusters from our dataset, rather than separating out.
+
+```{r}
+saveRDS(object = combined.ob,
+        file = file.path(wd, "Combined_Huang_5-HT_Zeisel_R1DR.rds"))
+```
+
+
+## Session Information
+
+Machine specifications:  
+
+* Mac Pro (Late 2013)  
+* macOS High Sierra 10.13.4  
+* 3.7 GHz Quad-Core Intel Xeon E5  
+* 64 GB 1866 MHz DDR3  
+* Java version "1.8.0_172"  
+
+```{r}
+devtools::session_info()
+```

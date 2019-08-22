@@ -1,0 +1,435 @@
+---
+title: "DRN Cell Types Project: Comparison with Dymecki Dataset (Okaty et al., 2015)"
+output: 
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+author: "Kee Wui Huang, Sabatini Lab (Harvard Medical School)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+# Notebook Overiew
+This notebook is a part of a series that documents the review analysis for the DRN Cell Types project.
+
+This notebook contains the code used to parse/format the RNA-seq data from Okaty et al. (2015) for comparison with both the Zeisel et al. (2018) dataset and our DRN inDrop scRNA-seq dataset, and the analysis steps taken for the comparison of pooled cells/clusters. 
+
+
+# Analysis Workflow
+
+## 1. Initialize
+
+### 1.1 Load libraries
+```{r}
+library(devtools)
+library(useful)
+library(dplyr)
+library(ggplot2)
+library(reticulate)
+library(Seurat)
+library(stringr)
+library(Matrix)
+library(parallel)
+library(ape)
+library(readxl)
+```
+
+### 1.2 Load data
+```{r}
+wd <- "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/"
+dRaphe.neurons <- readRDS(file.path(wd, "DRN_inDrop_neurons.rds"))
+dRaphe.neurons.5HT <- SubsetData(object = dRaphe.neurons,
+                            ident.use = c("5-HT-I",
+                                          "5-HT-II",
+                                          "5-HT-III",
+                                          "5-HT-IV",
+                                          "5-HT-V"),
+                            subset.raw = TRUE)
+dim(dRaphe.neurons.5HT@data)
+
+zeisel.ob.SER <- readRDS(file.path(wd, "zeisel_Seurat_HBSER_clustered_filtered.rds"))
+dim(zeisel.ob.SER@data)
+```
+
+```{r}
+okaty.data <- read_excel(file.path(wd, "1-s2.0-S0896627315008739-mmc2.xlsx"),
+                         sheet = 1,
+                         col_names = TRUE)
+dim(okaty.data)
+```
+
+### 1.3 Extract the row (gene) and column (sample) names
+
+```{r}
+colnames(okaty.data)
+```
+
+Separate pooled from single cell:
+```{r}
+okaty.data.pooled <- okaty.data[,c(4:21)]
+okaty.data.sc <- okaty.data[,c(22:77)]
+dim(okaty.data.pooled)
+dim(okaty.data.sc)
+```
+
+```{r}
+length(okaty.data$`Gene Symbol`)
+head(okaty.data$`Gene Symbol`)
+```
+
+```{r}
+length(unique(okaty.data$`Gene Symbol`))
+```
+
+```{r}
+tail(unique(okaty.data$`Gene Symbol`), 10)
+```
+
+```{r}
+okaty.genes <- okaty.data[,c(1:3)]
+dim(okaty.genes)
+colnames(okaty.genes)
+head(okaty.genes, 10)
+```
+
+```{r}
+is.element("mt-Co2", okaty.genes$`Gene Symbol`)
+```
+
+```{r}
+okaty.genes$`Gene Symbol`[(grepl("^mt", okaty.genes$`Gene Symbol`, ignore.case = TRUE))]
+```
+
+Mitochondial genes seem to be missing or have been excluded.
+
+There are also multiple annotations per gene. Check some of these values:
+```{r}
+corner(okaty.data)
+```
+
+The Methods section of Okaty et al. (2015) does not give clear details on how a single RefSeq annotation was used for analysis of GO term enrichment, and whether counts were collapsed by gene symbol at any point (which seems unlikely). They do include this in the sheet labeled "CPMs (filtered) and analysis".
+
+```{r}
+okaty.data.filtered <- read_excel(file.path(wd, "1-s2.0-S0896627315008739-mmc2.xlsx"),
+                         sheet = 2,
+                         col_names = TRUE)
+dim(okaty.data.filtered)
+```
+
+```{r}
+colnames(okaty.data.filtered)
+```
+
+```{r}
+length(okaty.data.filtered$`Gene Symbol`)
+length(unique(okaty.data.filtered$`Gene Symbol`))
+```
+
+```{r}
+head(okaty.data.filtered$`Gene Symbol`, 10)
+tail(okaty.data.filtered$`Gene Symbol`, 10)
+```
+
+```{r}
+okaty.data.filtered$`Gene Symbol`[(grepl("^mt", okaty.data.filtered$`Gene Symbol`, ignore.case = TRUE))]
+```
+
+```{r}
+okaty.data.filtered[okaty.data.filtered$`Gene Symbol`=="Ercc6l2", c(1:2)]
+```
+
+These 13,505 genes have been filtered and normalized according to the procedures outlined in Okaty et al. (2015):  
+
+* Only a single annotation was used per gene, as outlined in the edgeR user guide  
+* Detection threshold of CPM > 1  
+* Passes threshold in at least 3 samples (number of replicates for pooled samples)  
+
+
+## 2. Calculate correlation/distance scores between clusters/pooled cells
+
+For this analysis, we will use DE genes common across all 3 datasets, instead of all genes.
+
+### 2.1 Convert single cell data into pooled data
+
+#### 2.1.1 Sum counts across cells in a cluster
+
+Combine all of the DRN 5-HT neurons in our dataset into one "sample", since they are all R1-DR.
+```{r}
+data.batch1 <- read.csv(file = "/Volumes/Neurobio/MICROSCOPE/Kee Wui/InDrops/Analysis/rapheData/rapheWholeCell/DRN/O2/dRapheWholeCellAll2x_batch1_Control_filteredData.csv", 
+                        header = T, 
+                        row.names = 1)
+data.batch3 <- read.csv(file = "/Volumes/Neurobio/MICROSCOPE/Kee Wui/InDrops/Analysis/rapheData/rapheWholeCell/DRN/O2/dRapheWholeCellAll2x_batch3_Control_filteredData.csv", 
+                        header = T, 
+                        row.names = 1)
+huang.raw.data <- cbind(data.batch1, data.batch3)
+rm(data.batch1)
+rm(data.batch3)
+```
+
+```{r}
+huang.counts.5HT <- huang.raw.data[,dRaphe.neurons.5HT@cell.names]
+dim(huang.counts.5HT)
+huang.counts.5HT <- as.data.frame(apply(huang.counts.5HT, 1, FUN = sum))
+rownames(huang.counts.5HT) <- rownames(huang.raw.data)
+dim(huang.counts.5HT)
+head(huang.counts.5HT)
+```
+
+```{r, fig.width=16}
+hist(log10(huang.counts.5HT+1), breaks = 100, ylim = c(0, 1000))
+```
+
+```{r}
+rm(huang.raw.data)
+```
+
+Load the Zeisel count matrix:
+```{r}
+library(loomR)
+lfile <- connect(filename = "/Volumes/LaCie/Dropbox/Sabatini Lab/DRN Cell Types Project/DRN Cell Types Manuscript/Revisions (1)/RNA-seq/l6_r3_cholinergic_monoaminergic_and_peptidergic_neurons.loom")
+zeisel.expr <- t(lfile$matrix[,])
+zeisel.genes <- lfile$row.attrs$Gene[]
+zeisel.genes.fix <- str_replace(string = zeisel.genes,
+                                pattern = "-",
+                                replacement = ".")
+zeisel.cellIDs <- lfile$col.attrs$CellID[]
+zeisel.expr <- as.data.frame(x = zeisel.expr,
+                             row.names = zeisel.genes.fix)
+colnames(zeisel.expr) <- zeisel.cellIDs
+lfile$close_all()
+```
+
+Separate the Zeisel 5-HT neurons by rhombomere:
+```{r}
+zeisel.cells.r1dr <- WhichCells(object = zeisel.ob.SER,
+                                ident = c("R1 (lateral DRN)", "R1 (medial DRN)"))
+zeisel.counts.r1dr <- zeisel.expr[,zeisel.cells.r1dr]
+dim(zeisel.counts.r1dr)
+zeisel.counts.r1dr <- as.data.frame(apply(zeisel.counts.r1dr, 1, FUN = sum),
+                                    row.names = rownames(zeisel.expr))
+dim(zeisel.counts.r1dr)
+
+zeisel.cells.mrn <- WhichCells(object = zeisel.ob.SER,
+                                ident = c("R1/R2 (MRN)"))
+zeisel.counts.mrn <- zeisel.expr[,zeisel.cells.mrn]
+dim(zeisel.counts.mrn)
+zeisel.counts.mrn <- as.data.frame(apply(zeisel.counts.mrn, 1, FUN = sum),
+                                    row.names = rownames(zeisel.expr))
+dim(zeisel.counts.mrn)
+
+zeisel.cells.r5 <- WhichCells(object = zeisel.ob.SER,
+                                ident = c("R5 (RMg)"))
+zeisel.counts.r5 <- zeisel.expr[,zeisel.cells.r5]
+dim(zeisel.counts.r5)
+zeisel.counts.r5 <- as.data.frame(apply(zeisel.counts.r5, 1, FUN = sum),
+                                    row.names = rownames(zeisel.expr))
+dim(zeisel.counts.r5)
+
+zeisel.cells.r6p <- WhichCells(object = zeisel.ob.SER,
+                                ident = c("R6P (ROb/RPa)"))
+zeisel.counts.r6p <- zeisel.expr[,zeisel.cells.r6p]
+dim(zeisel.counts.r6p)
+zeisel.counts.r6p <- as.data.frame(apply(zeisel.counts.r6p, 1, FUN = sum),
+                                    row.names = rownames(zeisel.expr))
+dim(zeisel.counts.r6p)
+```
+
+```{r}
+head(zeisel.counts.r6p)
+```
+
+```{r}
+genes.common <- intersect(rownames(huang.counts.5HT), rownames(zeisel.expr))
+length(genes.common)
+head(genes.common)
+```
+
+
+Combine into a single data matrix:
+```{r}
+data.sc.huang <- as.data.frame(huang.counts.5HT[genes.common,])
+rownames(data.sc.huang) <- genes.common
+data.sc.zeisel <- cbind(zeisel.counts.r1dr[genes.common,], 
+                        zeisel.counts.mrn[genes.common,],
+                        zeisel.counts.r5[genes.common,],
+                        zeisel.counts.r6p[genes.common,])
+rownames(data.sc.zeisel) <- genes.common
+data.sc <- cbind(data.sc.zeisel, data.sc.huang)
+colnames(data.sc) <- c("Zeisel_R1DR", "Zeisel_MRN", "Zeisel_R5", "Zeisel_R6P", "Huang_5HT")
+dim(data.sc)
+corner(data.sc)
+```
+
+Combine with Okaty et al. (2015) pooled data:
+```{r}
+length(intersect(rownames(data.sc), okaty.data$`Gene Symbol`))
+okaty.genes.fixed <- str_replace(string = okaty.data$`Gene Symbol`,
+                                pattern = "-",
+                                replacement = ".")
+genes.common <- intersect(rownames(data.sc), okaty.genes.fixed)
+```
+
+```{r}
+genes.keep <- is.element(okaty.genes.fixed, genes.common)
+okaty.data.pooled <- okaty.data[genes.keep, c("Gene Symbol",
+                                              "R1 DR #1 Pooled",
+                                              "R1 DR #2 Pooled",
+                                              "R1 DR #3 Pooled",
+                                              "R1 MR #1 Pooled",
+                                              "R1 MR #2 Pooled",
+                                              "R1 MR #3 Pooled",
+                                              "R2 #1 Pooled",
+                                              "R2 #2 Pooled",
+                                              "R2 #3 Pooled",
+                                              "R3 #1 Pooled",
+                                              "R3 #2 Pooled",
+                                              "R3 #3 Pooled",
+                                              "R5 #1 Pooled",
+                                              "R5 #2 Pooled",
+                                              "R5 #3 Pooled",
+                                              "R6P #1 Pooled",
+                                              "R6P #2 Pooled",
+                                              "R6P #3 Pooled")]
+dim(okaty.data.pooled)
+head(okaty.data.pooled)
+```
+
+```{r}
+length(okaty.data.pooled$`Gene Symbol`)
+length(unique(okaty.data.pooled$`Gene Symbol`))
+length(unique(okaty.genes.fixed[genes.keep]))
+```
+
+Sum counts for genes with multiple annotations:
+```{r}
+geneSymbol <- unique(okaty.genes.fixed[genes.keep])
+okaty.data.pooled.agg <- matrix(nrow = length(geneSymbol), 
+                                ncol = length(colnames(okaty.data.pooled))-1)
+for (i in 1:length(geneSymbol)) {
+  temp <- as.matrix(okaty.data.pooled[okaty.data.pooled$`Gene Symbol`==geneSymbol[i], -1])
+  temp <- colSums(temp)
+  okaty.data.pooled.agg[i,] <- temp
+}
+okaty.data.pooled.agg <- as.data.frame(okaty.data.pooled.agg,
+                                       row.names = geneSymbol)
+colnames(okaty.data.pooled.agg) <- colnames(okaty.data.pooled[,-1])
+dim(okaty.data.pooled.agg)
+head(okaty.data.pooled.agg)
+```
+
+Sort both data frames by rownames and merge
+```{r}
+data.sc.filtered <- data.sc[geneSymbol,]
+data.combined <- cbind(data.sc.filtered, okaty.data.pooled.agg)
+dim(data.combined)
+head(rownames(data.combined))
+colnames(data.combined)
+```
+
+Save the merged data object as a csv file:
+```{r}
+write.table(data.combined, 
+            file = file.path(wd, "countData_pooled_merged.csv"), 
+            sep = ',', 
+            row.names = rownames(data.combined), 
+            col.names = NA)
+```
+
+
+#### 2.1.2 Normalization
+
+Try using the same normalization method used in Okaty et al. (2015):
+```{r}
+library(edgeR)
+```
+
+```{r}
+groups <- factor(c(rep("Zeisel", 4), "Huang", rep("Okaty", 18)))
+y <- DGEList(counts = data.combined, group = groups)
+y <- calcNormFactors(y)
+y$samples
+```
+
+Check effective library sizes:
+```{r}
+y$samples$lib.size*y$samples$norm.factors
+```
+
+Filter genes, keeping only genes with CPM > 1 in at least 3 samples:
+```{r}
+keep <- rowSums(cpm(y)>1) >= 3
+y <- y[keep,]
+dim(y)
+```
+
+Re-compute normalization factors
+```{r}
+y <- calcNormFactors(y)
+y$samples
+```
+
+Check effective library sizes:
+```{r}
+y$samples$lib.size*y$samples$norm.factors
+```
+
+Check MDS plot:
+```{r, fig.width=16}
+plotMDS(y, main = "MDS Plot")
+```
+
+Dimension 1 splits the different datasets, whereas dimension 2 separates the rhombomere groups, where the trend along dim 2 is the same across datasets.
+
+
+### 2.2 Find DE genes for calculating distance score
+
+Use the filtered Okaty data, thresholding on Q values < 0.05:
+```{r}
+okaty.DEgenes <- okaty.data.filtered$`Gene Symbol`[okaty.data.filtered$`FDR (from edgeR DE analysis)`<0.05]
+length(okaty.DEgenes)
+head(okaty.DEgenes, 10)
+tail(okaty.DEgenes, 10)
+is.element("En1", okaty.DEgenes)
+is.element("Slc17a8", okaty.DEgenes)
+is.element("Slc6a4", okaty.DEgenes)
+is.element("Fev", okaty.DEgenes)
+is.element("Actb", okaty.DEgenes)
+```
+
+Check similarities between clusters using hierarchical clustering, using CPM values of DE genes:
+```{r}
+y.cpm <- cpm(y)
+y.cpm.DEgenes <- y.cpm[is.element(rownames(y.cpm), okaty.DEgenes),]
+dim(y.cpm.DEgenes)
+```
+
+```{r}
+corner(y.cpm.DEgenes)
+```
+
+```{r}
+y.cpm.DEgenes["Slc6a4",]
+```
+
+```{r, fig.width=16}
+d <- dist(x = scale(t(y.cpm.DEgenes)), method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+plot(hc)
+```
+
+Clusters split mostly by dataset - probably because there is such a big difference in the library sizes that makes it difficult to normalize the data (artificially pooled scRNA-seq library sizes are much smaller than bulk RNA-seq libraries).
+
+
+## Session Information
+
+Machine specifications:  
+
+* Mac Pro (Late 2013)  
+* macOS High Sierra 10.13.4  
+* 3.7 GHz Quad-Core Intel Xeon E5  
+* 64 GB 1866 MHz DDR3  
+* Java version "1.8.0_172"  
+
+```{r}
+devtools::session_info()
+```
